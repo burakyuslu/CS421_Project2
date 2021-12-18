@@ -1,6 +1,8 @@
 import socket
 import sys
 import time
+import threading
+
 
 # returns the status code from a given HTTP response message
 def get_status_code(response):
@@ -9,12 +11,7 @@ def get_status_code(response):
 	stat_code_phrase = status_line[status_line.find(" ")+1:]
 	return stat_code_phrase
 
-
-'''
-Base ceil power of 2 will be 4096 as we need to include header information
-even if we do not have any object. Then, as we need more space to store
-header in addition to the object, I simply multiply the ceil with 2.
-'''
+# returns the smallest integer that is bigger than length and is a power of 2
 def ceil_power_2(length):
 	ceil_pow = 4096
 	while ceil_pow < length:
@@ -62,15 +59,11 @@ def get_directory(url):
 # returns the object from a response message
 def get_object(response):
 	idx = response.find("\r\n\r\n")
-	return response[idx+4:]
-
-def get_object_all(response):
-	idx = response.find("\r\n\r\n")
 	if idx == -1:
 		return ""
 	return response[idx+4:]
 
-
+# return the all parts of a response message combined
 def recv_all(sock, response):
 	timeout = 1
 	sock.setblocking(False)
@@ -91,13 +84,24 @@ def recv_all(sock, response):
 				time.sleep(0.2)
 		except:
 			pass
-		if len(get_object_all(data.decode())) == content_length:
+		if len(get_object(data.decode())) == content_length:
 			break
 	return data
 
-def recv_all_range(sock, response, lrange, urange):
+# download & return part of the file specified by lrange-urange, located in url
+# idx and lock are related to multithreading, idx is the index of the thread, lock is to avoid race conditions
+def download_file_part(response, lrange, urange, url, idx, lock):
+	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	host_url = url.split("/")[0]
+	sock.connect((host_url, 80))
+
+	directory = url[url.find('/'):]
+
+	request = "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes={}-{}\r\n\r\n".format(directory, host_url, lrange, urange)
+	sock.sendall(request.encode())
+
 	n = (urange - lrange + 1)
-	content_length = get_content_length(head_response)
+	content_length = get_content_length(response)
 	if content_length < (urange - lrange + 1):
 		n = content_length - lrange
 
@@ -119,60 +123,54 @@ def recv_all_range(sock, response, lrange, urange):
 				time.sleep(0.2)
 		except:
 			pass
-		if len(get_object_all(data.decode())) == n:
+		if len(get_object(data.decode())) == n:
 			break
-	return data
+	
+	sock.shutdown(socket.SHUT_RDWR)
+	sock.close()
 
-'''
+	lock.acquire()
+	global downloaded_file_parts
 
-def recv_all(sock, head_response):
-	data = bytearray()
-	content_length = get_content_length(head_response)
-	n = content_length + len(head_response)
-	while len(get_object_all(data.decode())) != content_length:
-		packet = sock.recv(8192)
-		if not packet:
-			return None
-		data.extend(packet)
-	return data
+	downloaded_file_parts[idx] = get_object(data.decode()) # decode the received data before appending it to the file parts array
+	lock.release()
 
 
-def recv_all_range(sock, head_response, lrange, urange):
-	n = (urange - lrange + 1)
-	content_length = get_content_length(head_response)
-	if content_length < (urange - lrange + 1):
-		n = content_length - lrange
-	data = bytearray()
-	while len(get_object_all(data.decode())) != n:
-		packet = sock.recv(8192)
-		if not packet:
-			return None
-		data.extend(packet)
-	return data
-'''
+# updates the thread_download_ranges with the correct boundaries
+# n is the content length, and k is the connection_cnt/parts to divide
+def get_thread_ranges(n, thread_download_ranges, k):
+	if n % k == 0:
+		current_end = 0
+		for download_range in thread_download_ranges:
+			download_range[0] = current_end
+			download_range[1] = current_end + (n // k) - 1
+			current_end += n // k
+	else:
+		current_end = 0
+		for connection_idx, download_range in enumerate(thread_download_ranges, 1):
+			if connection_idx <= (n - (n // k) * k):
+				download_range[0] = current_end
+				download_range[1] = current_end + (n // k)
+				current_end += (n // k) + 1
+			else:
+				download_range[0] = current_end
+				download_range[1] = current_end + (n // k) - 1
+				current_end += n // k
+
+
+# start main
+if len(sys.argv) != 3:
+	print("Incorrect # of arguments")
+	sys.exit()
 
 index_file = sys.argv[1]
-range_exists = False
-ranges = None
-LOWER_ENDPOINT = 0
-UPPER_ENDPOINT = 1
+connection_cnt = int(sys.argv[2])
 
 # get host URL from the index URL
 host_url = index_file.split("/")[0]
 print("URL of the index file: {}".format(index_file))
 
-# get arguments from the command line
-if len(sys.argv) == 3:
-	range_exists = True
-	ranges = sys.argv[2].split("-")
-	ranges = [int(i) for i in ranges]
-	print("Lower endpoint = {}".format(ranges[0]))
-	print("Upper endpoint = {}".format(ranges[1]))
-elif len(sys.argv) != 2:
-	print("Incorrect # of arguments")
-	sys.exit()
-else:
-	print("No range is given")
+print("Number of parallel connections: {}".format(connection_cnt))
 
 # instantiate the socket and connect to host
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -244,8 +242,13 @@ print("There are {} files in the index".format(len(file_urls)))
 s.shutdown(socket.SHUT_RDWR)
 s.close()
 
-
 for idx, url in enumerate(file_urls, 1):
+	# define the variables range(connection_cnt)
+	downloaded_file_parts = [''] * connection_cnt # parts of the downloaded file will be saved here
+	thread_download_ranges = []
+	for i in range(connection_cnt):
+		thread_download_ranges.append([0,0])
+	
 	# create new socket for each URL in the index file
 	file_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 	host_url = url.split("/")[0]
@@ -260,7 +263,6 @@ for idx, url in enumerate(file_urls, 1):
 	file_socket.sendall(request.encode())
 
 	response = file_socket.recv(16384).decode()
-
 	stat_code_phrase = get_status_code(response)
 
 
@@ -269,41 +271,42 @@ for idx, url in enumerate(file_urls, 1):
 		print("{}. {} is not found".format(idx, url))
 		continue
 
+	# close the file socket
+	file_socket.shutdown(socket.SHUT_RDWR)
+	file_socket.close()
+
 	# determine the buffer size
 	content_length = get_content_length(response)
 
-	if range_exists:
-		if content_length - 1 < ranges[LOWER_ENDPOINT]:
-			print("{}. {} (size = {}) is not downloaded".format(idx, url, content_length))
-			continue
+	get_thread_ranges(content_length, thread_download_ranges, connection_cnt)
 
-		# as range exists, we send request with the Range field in the header
-		request = "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes={}-{}\r\n\r\n".format(directory, host_url, ranges[LOWER_ENDPOINT], ranges[UPPER_ENDPOINT])
-		file_socket.sendall(request.encode())
+	threads = []
+	lock = threading.Lock() # lock for avoiding race conditions
 
-		response = recv_all_range(file_socket, response, ranges[LOWER_ENDPOINT], ranges[UPPER_ENDPOINT]).decode()
-		# response = file_socket.recv(buffer_size).decode()
+	# create the connection_cnt many threads
+	for connection in range(connection_cnt):
+		# each thread executes the download_file_part function with the specified parameters
+		cur_thread = threading.Thread(target=download_file_part, args=(response, thread_download_ranges[connection][0], thread_download_ranges[connection][1], url, connection, lock))
+		threads.append(cur_thread)
+		cur_thread.start()
 
-		l_content_rng, u_content_rng = get_content_range(response)
+	# wait for all threads to finish & terminate them
+	for index, thread in enumerate(threads, 1):
+		thread.join()
 
-		print("{}. {} (range = {}-{}) is downloaded".format(idx, url, l_content_rng, u_content_rng))
+	# combine downloaded parts
+	downloaded_content = ''.join(downloaded_file_parts)
+	
+	# print the relevant output on the console
+	print("{}. {} (size = {}) is downloaded".format(idx, url, content_length))
+	
+	file_parts = 'File parts: '
+	for down_range in thread_download_ranges:
+		file_parts += str(down_range[0]) + ":" + str(down_range[1]) + "(" + str(down_range[1] - down_range[0] + 1) + "), "
 
-		# write the object to a file
-		with open(filename, "w") as file:
-			obj = get_object(response)
-			file.write(obj)
-	else:
-		# as range does not exist, we send request without the Range field in the header
-		request = "GET {} HTTP/1.1\r\nHost: {}\r\n\r\n".format(directory, host_url)
-		file_socket.sendall(request.encode())
+	file_parts = file_parts[:-2] # remove the last , and space
+	print(file_parts)
 
-		response = recv_all(file_socket, response).decode()
-		# response = file_socket.recv(buffer_size).decode()
-
-		print("{}. {} (size = {}) is downloaded".format(idx, url, content_length))
-
-		# write the object to a file
-		with open(filename, "w") as file:
-			obj = get_object(response)
-			file.write(obj)
-
+	# write the object to a file
+	with open(filename, "w") as file:
+		file.write(downloaded_content)
