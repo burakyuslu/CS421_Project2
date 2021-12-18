@@ -11,6 +11,7 @@ def get_status_code(response):
 	stat_code_phrase = status_line[status_line.find(" ")+1:]
 	return stat_code_phrase
 
+
 # returns the smallest integer that is bigger than length and is a power of 2
 def ceil_power_2(length):
 	ceil_pow = 4096
@@ -63,6 +64,7 @@ def get_object(response):
 		return ""
 	return response[idx+4:]
 
+
 # return the all parts of a response message combined
 def recv_all(sock, response):
 	timeout = 1
@@ -87,6 +89,7 @@ def recv_all(sock, response):
 		if len(get_object(data.decode())) == content_length:
 			break
 	return data
+
 
 # download & return part of the file specified by lrange-urange, located in url
 # idx and lock are related to multithreading, idx is the index of the thread, lock is to avoid race conditions
@@ -174,17 +177,12 @@ print("Number of parallel connections: {}".format(connection_cnt))
 
 # instantiate the socket and connect to host
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
 s.connect((host_url, 80))
 
 directory = get_directory(index_file)
-# print("directory:", directory)
 
-# add HEAD request here
-
-# send an additional HEAD request to determine the buffer size for the object
+# send an HEAD request to determine the buffer size for the object
 head_request = "HEAD {} HTTP/1.1\r\nHost: {}\r\n\r\n".format(directory, host_url)
-
 s.sendall(head_request.encode())
 
 head_response = s.recv(16384).decode()
@@ -198,23 +196,15 @@ if stat_code_phrase != "200 OK":
 	print("Exiting!")
 	sys.exit()
 
-
 buffer_size = find_buffer_size(head_response)
 
 # send GET request to retrieve the index file
 request = "GET {} HTTP/1.1\r\nHost: {}\r\n\r\n".format(directory, host_url)
-
-# print("request:", request)
-
 s.sendall(request.encode())
 
 response = recv_all(s, head_response).decode()
-# response = s.recv(buffer_size).decode()
 
 print("Index file is downloaded")
-
-# print("Response")
-# print(response)
 
 # check the status code
 stat_code_phrase = get_status_code(response)
@@ -227,15 +217,10 @@ if stat_code_phrase != "200 OK":
 
 response_lines = response.split("\r\n")
 
-# print("Response lines")
-# print(response_lines)
-
 # get file URLs from the index file
 file_urls = response_lines[-1].split("\n")
 file_urls = [url for url in file_urls if len(url) != 0]
 
-# print("File URLs")
-# print(repr(file_urls))
 print("There are {} files in the index".format(len(file_urls)))
 
 # close the initial socket
